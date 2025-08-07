@@ -222,7 +222,6 @@ class DistributedGPUActor(BaseDistributedGPUActor):
             'max_seq_len': self.max_seq_len,
             'python_log_level': 'debug',
             'console_log_interval': '1ba',
-            'eval_interval': '1iter',
         }
         self.logger.info("Finished build_train_config")
 
@@ -329,14 +328,6 @@ class DistributedGPUActor(BaseDistributedGPUActor):
             SpeedMonitor(window_size=10),
         ]
 
-        # Try to add the ORL eval callback if the required dependencies are installed
-        try:
-            orl_eval_callback = self.build_orl_eval_callback()
-            callbacks.append(orl_eval_callback)
-        except Exception as e:
-            self.logger.warning(f"Failed to build ORL eval callback: {e}")
-            self.train_config.pop('eval_interval', None)
-
         self.ppo_trainer = Trainer(
             model=model,
             optimizers=optimizer,
@@ -353,9 +344,6 @@ class DistributedGPUActor(BaseDistributedGPUActor):
     def close_trainer(self):
         self.ppo_trainer.close()
     
-    def attach_vllm_engines(self, vllm_engines: list[Any]):
-        self.logger.info(f"Attaching {len(vllm_engines)} vLLM engines to the Training Actors")
-        self.ppo_trainer.state.vllm_engines = vllm_engines
 
     def add_rollouts(self, current_rank_rollouts: dict[str, Any]):
         """Adds the current rank's rollouts to the callback."""
@@ -481,7 +469,7 @@ class InferenceServer:
                 revision=None,
                 seed=1,
                 enable_prefix_caching=False,
-                max_model_len=_MAX_GEN_LEN,
+                max_model_len=_MAX_SEQ_LEN,
                 device_bundle={
                     'GPU': 1,
                     'CPU': 1,
@@ -492,6 +480,58 @@ class InferenceServer:
     @property
     def engines(self):
         return self.vllm_engines
+
+# Note: This needs to be re-worked once the repos are migrated.
+class EvalAgent:
+    """A synchronous Ray actor for handling evals."""
+
+    def __init__(
+        self,
+        vllm_engines: list[Any],
+        evals: list[dict[str, Any]],
+        eval_overrides: dict[str, Any],
+        experiment_name: str,
+        run_name: str,
+    ):
+        self.vllm_engines = vllm_engines
+        self.evals = evals
+        self.eval_overrides = eval_overrides
+        self.experiment_name = experiment_name
+        self.run_name = run_name
+        self.callback = self.build_callback()
+
+    def build_callback(self):
+        from llmfoundry.utils.builders import build_callback
+        # Using a minimal train_config to built the callback correctly.
+        train_config = {
+            'eval_interval': '1iter',
+            'python_log_level': 'debug',
+        }
+        kwargs = {
+            'evals': self.evals,
+            'eval_overrides': self.eval_overrides,
+        }
+        callback = build_callback(
+            name='orl_eval',
+            kwargs=kwargs,
+            train_config=train_config,
+        )
+
+        # Need to create a fake state to pass to fit_start to help the callback register correctly.
+        class _State:
+            vllm_engines = []
+        fake_state = _State()
+        fake_state.vllm_engines = self.vllm_engines
+
+        callback.fit_start(fake_state, logger=None)
+        return callback
+
+    def run_evaluation(self, step: int = 0):
+        """Run evaluation synchronously after weights are broadcast to vLLM engines."""
+        # _run_evaluation requires that mlflow_logger is not None (even though it is not used)
+        # As a consequence, we set it to 1 to circumvent the issue.
+        self.callback.mlflow_logger = 1
+        self.callback._run_evaluation(self.experiment_name, self.run_name, step)
 
 
 class RolloutAgent:
@@ -709,25 +749,29 @@ class PPOController:
         parameter_buffer: ParameterBuffer,
         experience_buffer: ExperienceBuffer,
         pretrain_model_name: str,
+        eval_agent: EvalAgent,
     ):
         self.train_actor = train_actor
         self.inference_server = inference_server
         self.rollout_agent = rollout_agent
         self.parameter_buffer = parameter_buffer
         self.experience_buffer = experience_buffer
+        self.eval_agent = eval_agent
         self.train_actor.build_models(pretrain_model_name)
         setup_process_groups(
             self.train_actor.master_actor,
             inference_server.engines,
             inference_server.vllm_tensor_parallel_size,
         )
-        self.train_actor.collective_methods.attach_vllm_engines(self.inference_server.engines)
 
     def train(self):
-        for _ in range(NUM_TRAIN_ITERATIONS):  # Example: train for 5 iterations
+        for curr_iter in range(NUM_TRAIN_ITERATIONS):  # Example: train for 5 iterations
             # NOTE: this loop is represents the logic happening in the current `iteration_start` of the OnPolicyCallback
             self.parameter_buffer.put({'actor_group': self.train_actor, 'inference_server': self.inference_server})
-            # Simple example of adding elements to the experience buffer
+            # Run evaluation after broadcasting weights to the vLLM engines
+            ray.get(self.eval_agent.run_evaluation.remote(step=curr_iter * NUM_BATCHES_PER_UPDATE))
+            # Once the evaluation is done and VLLM engines are available, we can get the next rollouts
+            # TODO: Check if we can call eval generation and rollout generation in parallel
             self.experience_buffer.put(self.rollout_agent.get_next_iter_rollouts())
             # Populate the train actor group with the rollouts and then train
             self.train_actor.add_latest_rollouts_from_buffer(self.experience_buffer)
@@ -766,10 +810,8 @@ def _run_single_controller_ppo(
             train_actor = TrainActorGroup(num_train_actors, DistributedGPUActor)
 
             # Create vLLM engines (or inference actors)
-            vllm_tensor_parallel_size = world_size - num_train_actors
-            num_vllm_engines = (
-                world_size - num_train_actors
-            ) // vllm_tensor_parallel_size
+            vllm_tensor_parallel_size = 1
+            num_vllm_engines = world_size - num_train_actors
             # TODO: Encapsulate this into a inference server manager class
             pretrain_model_name = config.pretrain_model_name
             inference_server = InferenceServer(
@@ -795,6 +837,21 @@ def _run_single_controller_ppo(
             streaming_dataset_actor = ray.remote(num_gpus=0)(StreamingDatasetActor).remote()
             rollout_agent = RolloutAgent(inference_server, streaming_dataset_actor)
 
+            # Create EvalAgent on CPU that uses the InferenceServer's vLLM engines
+            # TODO: When the yaml PR is merged, we should update the setup of the params
+            # here correctly.
+            eval_agent = ray.remote(num_gpus=0)(EvalAgent).remote(
+                inference_server.engines,
+                evals=[{'name': 'gsm8k'}, {'name': 'math_500'}],
+                eval_overrides={
+                    'generation_params': {
+                        'max_tokens': _MAX_GEN_LEN,
+                    },
+                },
+                experiment_name='test_single_controller_ppo',
+                run_name='test_single_controller_ppo',
+            )
+
             ppo_controller = PPOController(
                 train_actor,
                 inference_server,
@@ -802,6 +859,7 @@ def _run_single_controller_ppo(
                 parameter_buffer,
                 experience_buffer,
                 pretrain_model_name,
+                eval_agent=eval_agent,
             )
             ppo_controller.train()
 
